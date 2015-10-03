@@ -1,0 +1,410 @@
+**SV2414 and vrp2113**
+**Energy Storage Options in Sao Vicente**
+Note: This RMD does not contain setpoint calculation. Setpoint calculation, along with question 5 of 'Storage Capacity Effects on Capacity Factor' section (which uses setpoints) is included in another RMD following this one.
+```{r}
+
+```
+
+###**ANALYSIS OF ORIGINAL DISPATCH DATA**
+Import data required and rename columns for ease.
+```{r, echo=FALSE}
+setwd("C:/Users/Sagar/OneDrive/Documents/EI/Final")
+if(!require(plyr)) install.packages("plyr")
+library(plyr)
+if(!require(ggplot2)) install.packages("ggplot2")
+library(ggplot2)
+
+#Import data
+dem<-read.csv("sao.vicente.load.csv")
+wind<-read.csv("sao.vicente.wind.csv")
+mpc<-read.csv("v52-850KW-power-curve.csv")
+
+#Rename columns
+names(wind)[6]<-"del_hourly"
+names(wind)[5]<-"windspeed"
+names(wind)[4]<-"windgen"
+
+```
+Plot to check if imported data adheres to the Manufacturer's Power Curve.
+```{r}
+#Interpolate for MPC power 
+interp=splinefun(mpc$windspeed_mps, mpc$power_kW,method = "natural")
+#Find equivalent MPC power for the windspeeds we have
+wind$mpc_power<-interp(wind$windspeed)*7
+
+#Plot to check data
+plot0<-ggplot(wind, aes(x=wind$windspeed)) 
+plot0+geom_point(aes(y=wind$windgen),colour="blue",size=2)+geom_line(aes(y=wind$mpc_power),colour="red",size=1)+xlab("Wind Speed (mps)")+ylab("Generation (kWh)")+ggtitle("Generation vs. Windspeed before correction\nGeneration (blue) and MPC (red)")
+
+#Reassign values that are greater than MPC power equivalents to MPC power equivalents
+for (j in 1:nrow(wind)){
+  if(wind$windgen[j]>wind$mpc_power[j])
+    wind$windgen[j]<-wind$mpc_power[j]
+}
+```
+Plot to check if data has been corrected to MPC.
+```{r}
+#Plot to check if data has been corrected
+plot1<-ggplot(wind, aes(x=wind$windspeed)) 
+plot1+geom_point(aes(y=wind$windgen),colour="blue",size=2)+geom_line(aes(y=wind$mpc_power),colour="red",size=1)+xlab("Wind Speed (mps)")+ylab("Generation (kWh)")+ggtitle("Generation vs. Windspeed after correction\nGeneration (blue) and MPC (red)")
+```
+---
+Organize and clean data.
+```{r}
+#Convert date to date format
+wind$date<-as.Date(wind$date,format="%Y-%m-%d")
+#Create new column for datetime using date and hour
+wind$datetime=as.POSIXct(wind$date+wind$hour*(1/24)+(1/3), format="%Y-%m-%d %H:%M:%S", origin="2013-01-01 00:00:00")
+
+#Convert date and time to datetime format for demand data
+dem$data.pt2.date.time<-as.POSIXct(dem$data.pt2.date.time,format="%Y-%m-%d %H:%M:%S")
+#Rename columns
+names(dem)[3]<-"datetime"
+names(dem)[4]<-"demand"
+
+#Remove columns we don'tneed 
+wind<-wind[-c(1,2,3,7)]
+dem<-dem[-c(1,2)]
+
+#Merge generation and demand data
+ad<-merge(x = dem,y = wind,by="datetime",all.x=TRUE)
+
+#Check summary of wind speed and generation data
+summary(ad$windspeed)
+summary(ad$windgen)
+
+#Fill missing generation data
+ad$windspeed[is.na(ad$windspeed)]<-summary(wind$windspeed)[4]
+ad$del_hourly[is.na(ad$del_hourly)]<-0
+for (i in 1:nrow(ad)){
+  if(is.na(ad$windgen[i])){
+    ad$windgen[i]<-interp(wind$windspeed[i])*7
+    }
+}
+
+#Convert negative generation values to 0
+ad$del_hourly[ad$del_hourly<0]<-0
+ad$windgen[ad$windgen<0]<-0
+
+#Check summary of wind speed and generation data after correction
+summary(ad$windspeed)
+summary(ad$windgen)
+
+#Check summary of demand data
+summary(ad$demand)
+
+#Correct small demand values to mean demand
+ad$demand[ad$demand<quantile(ad$demand,0.005)]<-summary(ad$demand)[4]
+
+#Check summary of demand data after correction
+summary(ad$demand)
+```
+**1. Calculate the uncurtailed capacity factor of the wind farm over the course of this year in the absence of any energy storage options, as per the turbine power curve and wind speed**.
+```{r}
+#Calculate uncurtailed capacity factor
+cf_unc<-sum(ad$windgen)*100/(850*8760*7)
+sprintf("Before any baseload is applied, uncurtailed CF is %.2f percent",cf_unc)
+```
+**2. Calculate the curtailed capacity factor of the wind farm over the course of the year in the absence of energy storage, using dispatched power values. How much energy is lost over the course of the year due to curtailment?**
+```{r}
+#Find wind generation utilized
+for (j in 1:nrow(ad)){
+  ad$wind_utilized[j]=min(ad$windgen[j],ad$demand[j])
+}
+#Find curtailment
+ad$curtailment=ad$windgen-ad$wind_utilized
+ad$deficit=ad$demand-ad$wind_utilized
+sprintf("Before any baseload is applied, curtailment is %.2f kWh",sum(ad$curtailment))
+#Calculate curtailed capacity factor
+cf_c<-sum(ad$wind_utilized)*100/(850*8760*7)
+sprintf("Before any baseload is applied, curtailed CF is %.2f percent",cf_c)
+```
+Plot for this scenario:
+```{r}
+#Plot demand, generation and curtailment across the year
+plot2<-ggplot(ad, aes(x=ad$datetime)) 
+plot2+geom_point(aes(y=ad$demand),colour="blue",size=2)+geom_point(aes(y=ad$windgen),colour="green",size=2)+geom_point(aes(y=ad$curtailment),colour="red",size=2)+ylab("Energy (kWh)")+xlab("Time of the Year")+ggtitle("With no baseload \nDemand (blue), Wind Energy Generable (green) and curtailment (red)")
+
+```
+---
+**3. What periods of the year have the greatest amount of curtailment over the year? What parts of the year have the highest amount of unmet demand?**
+```{r}
+plot2+geom_line(aes(y=ad$curtailment),colour="red",size=1)+ylab("(kWh)")+xlab("Time of the Year")+ggtitle("Curtailment")
+plot2+geom_line(aes(y=ad$deficit),colour="red",size=1)+ylab("(kWh)")+xlab("Time of the Year")+ggtitle("Unmet Demand")
+```
+---
+###**APPLICATION OF CONSTANT BASELOAD GENERATION**
+**1. Consider the overall range of demand values over the course of the year. What would be a reasonable value for baseload generation? Why?**
+**2. Given this baseload value, calculate the new curtailment and capacity factor of the wind farm.**
+```{r}
+#Find optimum baseload
+ad$baseload=5320
+ad$totalsupply=ad$baseload+ad$windgen
+for (j in 1:nrow(ad)){
+    ad$ts_utilized[j]=min(ad$demand[j],ad$totalsupply[j])
+  }
+ad$ts_curtailment=ad$totalsupply-ad$ts_utilized
+ad$ts_deficit=ad$demand-ad$ts_utilized
+
+sprintf("Optimum baseload is found to be %.2f kWh",summary(ad$baseload)[4])
+sprintf("This is optimum because deficit is %.2f percent of curtailment, and therefore, curtailment can completely meet deficit with a large enough storage",100*(sum(ad$ts_deficit)/sum(ad$ts_curtailment)))
+sprintf("For optimum baseload, non-baseload energy not met by wind farm over the year is %.2f kWh",sum(ad$ts_deficit))
+sprintf("For optimum baseload, curtailment over the year is %.2f kWh",sum(ad$ts_curtailment))
+
+#Plot to show demand and generation lines for this optimum baseload
+plot3<-ggplot(ad, aes(x=ad$datetime)) 
+plot3+geom_line(aes(y=ad$demand),colour="blue",size=1)+geom_line(aes(y=ad$totalsupply),colour="green",size=1)+geom_line(aes(y=ad$ts_curtailment),colour="red",size=1)+geom_line(aes(y=ad$baseload),colour="black",size=1)+ylab("Energy (kWh)")+xlab("Time of the Year")+ggtitle("With optimum Baseload \nDemand (blue), Wind Energy Generable (green), Curtailment (red) and Baseload (black)")
+
+#Find capacity factor with optimum baseload
+sum=0.0
+for (i in 1:nrow(ad)){
+sum=sum+max(ad$ts_utilized[i]-ad$baseload[i],0.0)
+}
+cf_c_bl=sum*100/(850*8760*7)
+sprintf("For this baseload, curtailed CF is %.2f percent",cf_c_bl)
+```
+###**STORAGE CAPACITY EFFECTS ON CAPACITY FACTOR**
+**1. Perform an energy balance on the system over the entire year, assuming no energy storage.**
+**How much non-baseload energy is not met by the wind farm (and must be met by extra diesel energy) over the course of the year?**
+**How much energy is lost over the year due to excess generation (i.e. what is the curtailment over the year?)**
+```{r}
+#With 3MW baseload
+ad$baseload2=5500.0
+ad$totalsupply2=ad$baseload2+ad$windgen
+for (j in 1:nrow(ad)){
+    ad$ts_utilized2[j]=min(ad$demand[j],ad$totalsupply2[j])
+  }
+ad$ts_curtailment2=ad$totalsupply2-ad$ts_utilized2
+ad$ts_deficit2=ad$demand-ad$ts_utilized2
+sprintf("New baseload is %.2f kWh",summary(ad$baseload2)[4])
+sprintf("For this baseload, non-baseload energy not met by wind farm over the year is %.2fkWh",sum(ad$ts_deficit2))
+sprintf("For this baseload, curtailment over the year is %.2fkWh",sum(ad$ts_curtailment2))
+
+#Plot to show demand and generation lines for this baseload
+plot4<-ggplot(ad, aes(x=ad$datetime)) 
+plot4+geom_line(aes(y=ad$demand),colour="blue",size=1)+geom_line(aes(y=ad$totalsupply2),colour="green",size=1)+geom_line(aes(y=ad$ts_curtailment2),colour="red",size=1)+geom_line(aes(y=ad$baseload2),colour="black",size=1)+ylab("Energy (kWh)")+xlab("Time of the Year")+ggtitle("With 3000 kW Baseload \nDemand (blue), Wind Energy Generable (green), Curtailment (red) and Baseload (black)")
+
+#Find capacity factor
+sum2=0.0
+for (i in 1:nrow(ad)){
+sum2=sum2+max(ad$ts_utilized2[i]-ad$baseload2[i],0.0)
+}
+cf_c_bl2=sum2*100/(850*8760*7)
+sprintf("For this baseload, curtailed CF is %.2f percent",cf_c_bl2)
+```
+**2. Now, using a simple loop (see the previous projects) and creating a running capacity total over each hour of the year, estimate the amount of recoverable energy possible by implementing this 10MWh storage. How much energy is recovered compared to the amount of non-baseload energy not met by wind over the course of the year? What is the new effective capacity factor of the wind farm?**
+**3. Perform analogous calculations for a variety of different storage capacities for 3MW constant baseload power or the proposed setpoint-defined baseload generation curve. What point would be considered optimum, to deliver the highest fraction of unmet non-baseload capacity with storage discharged energy? Explain your reasoning.**
+```{r}
+#Run 3MW baseload scenario for various storage options
+storagecap<-data.frame("Storage_Cap"=c(1,2,3,4,5,6,7,8,9,10,12,14,16,18,20,22.5,25,27.5,30))
+storagecap$Storage_Cap<-storagecap$Storage_Cap*10000.0
+
+for (j in 1:nrow(storagecap)){
+  #Calculate state of  storage at each hour
+  ad$storage[1]=min(0.8*ad$ts_curtailment2[1],storagecap$Storage_Cap[j])
+  for (i in 2:nrow(ad)){
+    #with curtailment
+    if (ad$ts_deficit2[i]==0){
+      ad$storage[i]=min((ad$storage[i-1]+0.8*ad$ts_curtailment2[i]),storagecap$Storage_Cap[j])
+      }
+    #With deficit
+    else if (ad$ts_curtailment2[i]==0){
+      ad$storage[i]=max(ad$storage[i-1]-((ad$ts_deficit2[i])/0.8),0.0)
+      }
+  }
+  
+  #Calculate net WE used in each hour
+  ad$we_used[1]=max(ad$ts_utilized2[1]-ad$baseload2[1],0.0)
+  #Find total wind energy supplied (including from storage) at each hour
+  for (i in 2:nrow(ad)){
+    if (ad$ts_deficit2[i]==0){
+      ad$we_used[i]=max(ad$ts_utilized2[i]-ad$baseload2[i],0.0)
+      }
+    else if (ad$ts_curtailment2[i]==0){
+    ad$we_used[i]=max(ad$ts_utilized2[i]-ad$baseload2[i],0.0)+(ad$storage[i-1]-ad$storage[i])*0.8
+    }
+  }
+  
+  #Print storage capacity
+  sprintf("Storage Capacity: %.2f kWh",storagecap$Storage_Cap[j])
+  
+  #Print previous useful WE
+  sprintf("Without storage, net useful wind energy is %.2f kWh",sum2)
+  
+  #Print new useful WE
+  sprintf("With storage, net useful wind energy is % .2fkWh",sum(ad$we_used))
+  storagecap$WE_useful[j]=sum(ad$we_used)
+  
+  #Print additional useful WE
+  sprintf("Therefore additional useful wind energy due to storage is %.2f kWh",sum(ad$we_used)-sum2)
+  storagecap$benefit[j]=sum(ad$we_used)-sum2
+  
+  #Print fraction of previous curtailment saved
+  sprintf("This is %.2f percent of the curtailment that would have occured without storage, %.2f kWh",(sum(ad$we_used)-sum2)*100/sum(ad$ts_curtailment2),sum(ad$ts_curtailment2))
+  storagecap$frac.c.saved[j]=(sum(ad$we_used)-sum2)*100/sum(ad$ts_curtailment2)
+  
+  storagecap$curtailment[j]=sum(ad$ts_curtailment2)
+  
+  #Print fraction of previous unmet demand now met
+  sprintf("Therefore, %.2f kWh (%.2f percent) of non-baseload energy not met by the wind farm earlier, %.2f kWh, can be met by adding storage",sum(ad$we_used)-sum2,(sum(ad$we_used)-sum2)*100/sum(ad$ts_deficit2),sum(ad$ts_deficit2))
+  storagecap$frac.d.met[j]=(sum(ad$we_used)-sum2)*100/sum(ad$ts_deficit2)
+  
+  storagecap$deficit[j]=sum(ad$ts_deficit2)
+  
+  #Print new capacity factor
+  cf_c_bl2_st=sum(ad$we_used)*100/(850*8760*7)
+  sprintf("Capacity factor with storage is %.2f percent",cf_c_bl2_st)
+  storagecap$newCF[j]=cf_c_bl2_st
+}
+
+#Print for 10MWh storage capacity scenario
+#Print storage capacity
+sprintf("Storage Capacity: %.2f kWh",storagecap$Storage_Cap[1])
+
+#Print previous useful WE
+sprintf("Without storage, net useful wind energy is %.2f kWh",sum2)
+
+#Print new useful WE
+sprintf("With storage, net useful wind energy is % .2fkWh",storagecap$WE_useful[1])
+
+#Print additional useful WE
+sprintf("Therefore additional useful wind energy due to storage is %.2f kWh",storagecap$benefit[1])
+
+#Print fraction of previous curtailment saved
+sprintf("This is %.2f percent of the curtailment that would have occured without storage.",storagecap$frac.c.saved[1])
+
+#Print fraction of previous unmet demand now met
+sprintf("Therefore, %.2f kWh (%.2f percent) of non-baseload energy not met by the wind farm earlier, %.2f kWh, can be met by adding storage",storagecap$benefit[1],storagecap$frac.d.met[1],(100/4.81)*storagecap$benefit[1])
+
+#Print new capacity factor
+sprintf("Capacity factor with storage is %.2f percent",storagecap$newCF[1])
+
+#Plot useful WE for each storage scenario
+plot5<-ggplot(storagecap, aes(x=storagecap$Storage_Cap,y=storagecap$WE_useful)) 
+plot5+geom_line(colour="blue",size=1)+geom_text(size=4, label=paste(round(storagecap$Storage_Cap, 2), round(storagecap$WE_useful, 2), sep=","))+xlim(0,5000+storagecap$Storage_Cap[nrow(storagecap)])+ylab("Annual Delivered Wind Energy (kWh)")+xlab("Storage Capacity (kWh)")+ggtitle("Annual Delivered Wind Energy vs. Storage Capacity")
+
+#Plot additional useful WE due to storage, for each storage scenario
+plot6<-ggplot(storagecap, aes(x=storagecap$Storage_Cap,y=storagecap$benefit)) 
+plot6+geom_line(colour="blue",size=1)+geom_text(size=4, label=paste(round(storagecap$Storage_Cap, 2), round(storagecap$benefit, 2), sep=","))+xlim(0,5000+storagecap$Storage_Cap[nrow(storagecap)])+ylab("Energy Recovered (kWh)")+xlab("Storage Capacity (kWh)")+ggtitle("Energy Recovery due to Storage Facility")
+
+#Plot fraction of curtailed energy recovered, for each storage scenario
+plot7<-ggplot(storagecap, aes(x=storagecap$Storage_Cap,y=storagecap$frac.c.saved)) 
+plot7+geom_line(colour="blue",size=1)+geom_text(size=4, label=paste(round(storagecap$Storage_Cap, 2), round(storagecap$frac.c.saved, 2), sep=","),hjust = 1, vjust = 1)+ylab("Fraction of Curtailed Energy Recovered (%)")+xlim(0,5000+storagecap$Storage_Cap[nrow(storagecap)])+xlab("Storage Capacity (kWh)")+ggtitle("Fraction of Wind Energy Curtailment Recovered due to Storage Facility")
+
+#Plot fraction of unmet demand now met, for each storage scenario
+plot8<-ggplot(storagecap, aes(x=storagecap$Storage_Cap,y=storagecap$frac.d.met)) 
+plot8+geom_line(colour="blue",size=1)+geom_text(size=4, label=paste(round(storagecap$Storage_Cap, 2), round(storagecap$frac.d.met, 2), sep=","),hjust = 1, vjust = 1)+xlim(0,5000+storagecap$Storage_Cap[nrow(storagecap)])+ylab("Fraction of Deficit Met (%)")+xlab("Storage Capacity (kWh)")+ggtitle("Fraction of Unmet Demand now met due to Storage Facility")
+
+#Plot CFs with storage, for each storage scenario
+plot9<-ggplot(storagecap, aes(x=storagecap$Storage_Cap,y=storagecap$newCF), label=text) 
+plot9+geom_line(colour="blue",size=1)+geom_text(size=4, label=paste(round(storagecap$Storage_Cap, 2), round(storagecap$newCF, 2), sep=","),hjust = 1, vjust = 1)+ylab("Capacity Factor (%)")+xlab("Storage Capacity (kWh)")+xlim(0,5000+storagecap$Storage_Cap[nrow(storagecap)])+ggtitle("Capacity Factors with Storage Facility")
+```
+---
+4. Perform analogous calculations for a variety of different baseload power for the 10MWh storage system. What point would be considered optimum, to deliver the highest fraction of unmet non-baseload capacity with storage discharged energy? Explain your reasoning.
+```{r}
+#Different baseload scenarios
+bl<-data.frame("baseload"=c(30,40,50,55,60,70,80))
+
+for (k in 1:nrow(bl)){
+  bl$baseload[k]=bl$baseload[k]*100.0
+  ad$baseload3=bl$baseload[k]
+  
+  ad$totalsupply3=ad$baseload3+ad$windgen
+  
+  for (j in 1:nrow(ad)){
+      ad$ts_utilized3[j]=min(ad$demand[j],ad$totalsupply3[j])
+    }
+  #Calculate curtailment
+  ad$ts_curtailment3=ad$totalsupply3-ad$ts_utilized3
+  #Calculate deficit
+  ad$ts_deficit3=ad$demand-ad$ts_utilized3
+  
+  #Print baseload
+  sprintf("Baseload is %.2f kWh",summary(ad$baseload3)[4])
+  
+  #Print non-baseload energy not met by windfarm
+  sprintf("For this baseload, non-baseload energy not met by wind farm over the year is %.2fkWh",sum(ad$ts_deficit3))
+  bl$deficit[k]=sum(ad$ts_deficit3)
+  
+  #Print curtailment
+  sprintf("For this baseload, curtailment over the year is %.2fkWh",sum(ad$ts_curtailment3))
+  bl$curtailment[k]=sum(ad$ts_curtailment3)
+  
+  #Find capacity factor
+  sum3=0.0
+  for (i in 1:nrow(ad)){
+  sum3=sum3+max(ad$ts_utilized3[i]-ad$baseload3[i],0.0)
+  }
+  cf_c_bl3=sum3*100/(850*8760*7)
+  
+  #Print capacity factor
+  sprintf("For this baseload, curtailed CF is %.2f percent",cf_c_bl3)
+  bl$CFwst[k]=cf_c_bl3
+  
+  #Calculate state of  storage at each hour
+  ad$storage3[1]=min(0.8*ad$ts_curtailment3[1],10000.0)
+  for (i in 2:nrow(ad)){
+    #With curtailment
+    if (ad$ts_deficit3[i]==0){
+      ad$storage3[i]=min((ad$storage3[i-1]+0.8*ad$ts_curtailment3[i]),10000.0)
+      }
+    #With deficit
+    else if (ad$ts_curtailment3[i]==0){
+      ad$storage3[i]=max(ad$storage3[i-1]-((ad$ts_deficit3[i])/0.8),0.0)
+      }
+  }
+  
+  #Calculate net WE used in each hour
+  ad$we_used3[1]=max(ad$ts_utilized3[1]-ad$baseload3[1],0.0)
+  #Find total wind energy supplied (including from storage) at each hour
+  for (i in 2:nrow(ad)){
+    if (ad$ts_deficit3[i]==0){
+      ad$we_used3[i]=max(ad$ts_utilized3[i]-ad$baseload3[i],0.0)
+      }
+    else if (ad$ts_curtailment3[i]==0){
+    ad$we_used3[i]=max(ad$ts_utilized3[i]-ad$baseload3[i],0.0)+(ad$storage3[i-1]-ad$storage3[i])*0.8
+    }
+  }
+  
+  #Print baseload
+  sprintf("Baseload: %.2f kWh",bl$baseload[k])
+  
+  #Print previous useful WE
+  sprintf("Without storage, net useful wind energy is %.2f kWh",sum3)
+  
+  #Print new useful WE
+  sprintf("With storage, net useful wind energy is % .2fkWh",sum(ad$we_used3))
+  bl$WE_useful[k]=sum(ad$we_used3)
+  
+  #Print additional useful WE
+  sprintf("Therefore additional useful wind energy due to storage is %.2f kWh",sum(ad$we_used3)-sum3)
+  bl$benefit[k]=sum(ad$we_used3)-sum3
+  
+  #Print fraction of previous curtailment saved
+  sprintf("This is %.2f percent of the curtailment that would have occured without storage, %.2f kWh",(sum(ad$we_used3)-sum3)*100/sum(ad$ts_curtailment3),sum(ad$ts_curtailment3))
+  bl$frac.c.saved[k]=(sum(ad$we_used3)-sum3)*100/sum(ad$ts_curtailment3)
+  
+  #Print fraction of previous unmet demand now met
+  sprintf("Therefore, %.2f kWh (%.2f percent) of non-baseload energy not met by the wind farm earlier, %.2f kWh, can be met by adding storage",sum(ad$we_used3)-sum3,(sum(ad$we_used3)-sum3)*100/sum(ad$ts_deficit3),sum(ad$ts_deficit3))
+  bl$frac.d.met[k]=(sum(ad$we_used3)-sum3)*100/sum(ad$ts_deficit3)
+  
+  #Calculate remaining deficit to be met by diesel generation
+  bl$rem.deficit[k]=sum(ad$ts_deficit3)-(sum(ad$we_used3)-sum3)
+  
+  #Print new capacity factor
+  cf_c_bl3_st=sum(ad$we_used3)*100/(850*8760*7)
+  sprintf("Capacity factor with storage is %.2f percent",cf_c_bl3_st)
+  bl$newCF[k]=cf_c_bl3_st
+}
+
+#Plot CFs with storage, for each baseload scenario
+plot10<-ggplot(bl, aes(x=bl$baseload)) 
+plot10+geom_line(aes(y=bl$newCF),colour="blue",size=1)+geom_line(aes(y=bl$CFwst),colour="red",size=1)+ylab("Capacity Factor (%)")+xlab("Baseload (kWh)")+xlim(bl$baseload[1]-500,500+bl$baseload[nrow(bl)])+ggtitle("Capacity Factors vs Baseload\nWith Storage (blue) and Without Storage (Red)")
+
+plot11<-ggplot(bl, aes(x=bl$baseload)) 
+plot11+geom_line(aes(y=bl$frac.d.met),colour="blue",size=1)+ylab("Fraction of Deficit Met (%)")+xlab("Baseload (kWh)")+xlim(bl$baseload[1]-500,500+bl$baseload[nrow(bl)])+ggtitle("Fraction of Deficit Met due to Storage, vs Baseload")
+```
+
+
+
+

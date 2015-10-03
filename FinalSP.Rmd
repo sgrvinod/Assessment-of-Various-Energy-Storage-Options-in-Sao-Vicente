@@ -1,0 +1,198 @@
+**SV2414 and vrp2113**
+**Energy Storage Options in Sao Vicente**
+Note: This RMD contains setpoint calculation, along with question 5 of 'Storage Capacity Effects on Capacity Factor' section (which uses setpoints).
+```{r, echo=FALSE}
+setwd("C:/Users/Sagar/OneDrive/Documents/EI/Final")
+if(!require(plyr)) install.packages("plyr")
+library(plyr)
+if(!require(ggplot2)) install.packages("ggplot2")
+library(ggplot2)
+
+#Import data
+dem<-read.csv("sao.vicente.load.csv")
+wind<-read.csv("sao.vicente.wind.csv")
+mpc<-read.csv("v52-850KW-power-curve.csv")
+
+#Rename columns
+names(wind)[6]<-"del_hourly"
+names(wind)[5]<-"windspeed"
+names(wind)[4]<-"windgen"
+
+#Interpolate for MPC power 
+interp=splinefun(mpc$windspeed_mps, mpc$power_kW,method = "natural")
+#Find equivalent MPC power for the windspeeds we have
+wind$mpc_power<-interp(wind$windspeed)*7
+
+#Reassign values that are greater than MPC power equivalents to MPC power equivalents
+for (j in 1:nrow(wind)){
+  if(wind$windgen[j]>wind$mpc_power[j])
+    wind$windgen[j]<-wind$mpc_power[j]
+}
+
+#Convert date to date format
+wind$date<-as.Date(wind$date,format="%Y-%m-%d")
+#Create new column for datetime using date and hour
+wind$datetime=as.POSIXct(wind$date+wind$hour*(1/24)+(1/3), format="%Y-%m-%d %H:%M:%S", origin="2013-01-01 00:00:00")
+
+#Convert date and time to datetime format for demand data
+dem$data.pt2.date.time<-as.POSIXct(dem$data.pt2.date.time,format="%Y-%m-%d %H:%M:%S")
+#Rename columns
+names(dem)[3]<-"datetime"
+names(dem)[4]<-"demand"
+
+#Remove columns we don'tneed 
+wind<-wind[-c(1,2,3,7)]
+dem<-dem[-c(1,2)]
+
+#Merge generation and demand data
+ad<-merge(x = dem,y = wind,by="datetime",all.x=TRUE)
+
+#Fill missing generation data
+ad$windspeed[is.na(ad$windspeed)]<-summary(wind$windspeed)[4]
+ad$del_hourly[is.na(ad$del_hourly)]<-0
+for (i in 1:nrow(ad)){
+  if(is.na(ad$windgen[i])){
+    ad$windgen[i]<-interp(wind$windspeed[i])*7
+    }
+}
+
+#Convert negative generation values to 0
+ad$del_hourly[ad$del_hourly<0]<-0
+ad$windgen[ad$windgen<0]<-0
+
+#Correct small demand values to mean demand
+ad$demand[ad$demand<quantile(ad$demand,0.005)]<-summary(ad$demand)[4]
+```
+###**REFINING SYSTEM SETPOINTS**
+**1. Propose a reasonable set of setpoints for wind farm generation and baseload generation. How do these values affect the curtailment and capacity factor?**
+```{r}
+#Average demand in the evenings
+avgeved=summary(ad$demand[(as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour>=17 & (as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour<=21])[4]
+#Average demand in the day
+avgdayd=summary(ad$demand[(as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour>=6 & (as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour<=16])[4]
+#Average demand at late nights
+avglnd=summary(ad$demand[(as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour>=22 | (as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour<=05])[4]
+
+#Average windgen in the evenings
+avgevegen=summary(ad$windgen[(as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour>=17 & (as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour<=21])[4]
+#Average windgen in the day
+avgdaygen=summary(ad$windgen[(as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour>=6 & (as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour<=16])[4]
+#Average windgen at late nights
+avglngen=summary(ad$windgen[(as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour>=22 | (as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour<=05])[4]
+
+#Average deficit in the evenings, day and late nights
+avgevedef=avgeved-avgevegen
+avgdaydef=avgdayd-avgdaygen
+avglndef=avglnd-avglngen
+
+#Assign setpoints for baseload
+for (i in 1:nrow(ad)){
+  if((as.POSIXlt(ad$datetime[i],format="%Y-%m-%d %H:%M:%S"))$hour>=17 & (as.POSIXlt(ad$datetime[i],format="%Y-%m-%d %H:%M:%S"))$hour<=21){
+    ad$blsp[i]=avgevedef
+    }
+  if((as.POSIXlt(ad$datetime[i],format="%Y-%m-%d %H:%M:%S"))$hour>=6 & (as.POSIXlt(ad$datetime[i],format="%Y-%m-%d %H:%M:%S"))$hour<=16){
+    ad$blsp[i]=avgdaydef
+    }
+  if((as.POSIXlt(ad$datetime[i],format="%Y-%m-%d %H:%M:%S"))$hour>=22 | (as.POSIXlt(ad$datetime[i],format="%Y-%m-%d %H:%M:%S"))$hour<=05){
+    ad$blsp[i]=avglndef
+  }
+  #Find gap to be filled above baseload
+  ad$gap[i]=max(ad$demand[i]-ad$blsp[i],0.0)
+}
+
+#Find average gap to be filled in evenings, days and late nights, and take appropriate fraction
+avgevegap=0.76*summary(ad$gap[(as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour>=17 & (as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour<=21])[4]
+avgdaygap=0.76*summary(ad$gap[(as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour>=6 & (as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour<=16])[4]
+avglngap=0.76*summary(ad$gap[(as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour>=22 | (as.POSIXlt(ad$datetime,format="%Y-%m-%d %H:%M:%S"))$hour<=05])[4]
+
+#Calculate setpoints for generation
+for (i in 1:nrow(ad)){
+   if((as.POSIXlt(ad$datetime[i],format="%Y-%m-%d %H:%M:%S"))$hour>=17 & (as.POSIXlt(ad$datetime[i],format="%Y-%m-%d %H:%M:%S"))$hour<=21){
+    ad$gensp[i]=avgevegap
+    }
+  if((as.POSIXlt(ad$datetime[i],format="%Y-%m-%d %H:%M:%S"))$hour>=6 & (as.POSIXlt(ad$datetime[i],format="%Y-%m-%d %H:%M:%S"))$hour<=16){
+    ad$gensp[i]=avgdaygap
+    }
+  if((as.POSIXlt(ad$datetime[i],format="%Y-%m-%d %H:%M:%S"))$hour>=22 | (as.POSIXlt(ad$datetime[i],format="%Y-%m-%d %H:%M:%S"))$hour<=05){
+    ad$gensp[i]=avglngap
+  }
+  #Update generation values based on the setpoints
+  ad$newwindgen[i]=min(ad$windgen[i],ad$gensp[i])
+  #Find total supply
+  ad$totalsupply[i]=ad$newwindgen[i]+ad$blsp[i]
+  #Find total delivered power
+  ad$sputilized[i]=min(ad$demand[i],ad$totalsupply[i])
+}
+
+#Calculate curtailment
+ad$spcurtailment=ad$totalsupply-ad$sputilized
+#Calculate deficit
+ad$spdeficit=ad$demand-ad$sputilized
+
+#Print curtailment
+sprintf("The total curtailment over the year, using setpoints, is %.2f kWh",sum(ad$spcurtailment))
+
+#Calculate curtailed capacity factor
+sum=0.0
+for (i in 1:nrow(ad)){
+sum=sum+max(ad$sputilized[i]-ad$blsp[i],0.0)
+}
+cf_c_sp=sum*100/(850*8760*7)
+sprintf("Using setpoints for baseload and wind generation, curtailed CF is %.2f percent",cf_c_sp)
+```
+###**STORAGE CAPACITY EFFECTS ON CAPACITY FACTOR**
+**5. Finally, perform the same calculations for your proposed storage capacity and set point values. How much additional energy is now recoverable via storage?**
+```{r}
+#Calculate state of  storage at each hour
+ad$storage[1]=min(0.8*ad$spcurtailment[1],10000.0)
+for (i in 2:nrow(ad)){
+  if (ad$spdeficit[i]==0){
+    ad$storage[i]=min((ad$storage[i-1]+0.8*ad$spcurtailment[i]),10000.0)
+    }
+  #With deficit
+  else if (ad$spcurtailment[i]==0){
+    ad$storage[i]=max(ad$storage[i-1]-((ad$spdeficit[i])/0.8),0.0)
+    }
+}
+
+#Calculate net WE used in each hour
+ad$we_used[1]=max(ad$sputilized[1]-ad$blsp[1],0.0)
+#Find total wind energy supplied (including from storage) at each hour
+for (i in 2:nrow(ad)){
+  if (ad$spdeficit[i]==0){
+    ad$we_used[i]=max(ad$sputilized[i]-ad$blsp[i],0.0)
+    }
+  else if (ad$spcurtailment[i]==0){
+  ad$we_used[i]=max(ad$sputilized[i]-ad$blsp[i],0.0)+(ad$storage[i-1]-ad$storage[i])*0.8
+  }
+}
+
+
+#Print previous useful WE
+sprintf("Without storage, net useful wind energy is %.2f kWh",sum)
+
+#Print new useful WE
+sprintf("With storage, net useful wind energy is % .2fkWh",sum(ad$we_used))
+
+#Print additional useful WE
+sprintf("Therefore additional useful wind energy recoverable from storage is %.2f kWh",sum(ad$we_used)-sum)
+
+
+#Print fraction of previous curtailment saved
+sprintf("This is %.2f percent of the curtailment that would have occured without storage, %.2f kWh",(sum(ad$we_used)-sum)*100/sum(ad$spcurtailment),sum(ad$spcurtailment))
+
+
+#Print fraction of previous unmet demand now met
+sprintf("Therefore, %.2f kWh (%.2f percent) of non-baseload energy not met by the wind farm earlier, %.2f kWh, can be met by adding storage",sum(ad$we_used)-sum,(sum(ad$we_used)-sum)*100/sum(ad$spdeficit),sum(ad$spdeficit))
+
+#Print new capacity factor
+cf_c_bl_st_sp=sum(ad$we_used)*100/(850*8760*7)
+sprintf("Capacity factor with storage is %.2f percent",cf_c_bl_st_sp)
+
+plot3<-ggplot(ad, aes(x=ad$datetime)) 
+plot3+geom_point(aes(y=ad$demand),colour="blue",size=1)+geom_point(aes(y=ad$blsp),colour="black",size=1)+geom_point(aes(y=ad$blsp+ad$gensp),colour="red",size=1)+ylab("Energy (kWh)")+xlab("Time of the Year")+ggtitle("Set Points against Demand\n Baseload (black), Generation (red) and Demand (blue)")
+
+plot4<-ggplot(ad, aes(x=ad$datetime))
+plot4+geom_line(aes(y=ad$demand),colour="blue",size=1)+geom_line(aes(y=ad$blsp),colour="black",size=1)+geom_line(aes(y=ad$totalsupply),colour="red",size=1)+ylab("Energy (kWh)")+xlab("Time of the Year")+ggtitle("Supply and Demand\n Baseload (black), Total supply (red) and Demand (blue)")
+```
+
